@@ -185,7 +185,7 @@ jobs:
           echo LIB=%LIB%
 
       # Inject MSVC opt flags into DXC CMakeLists after project(LLVM).
-      # Strip security / debug cost flags:
+      # Strip security / debug cost flags (line-based; avoid brittle multiline regex):
       #   CMakeLists: /guard:cf, /CETCOMPAT, /INCREMENTAL:NO (+ /DEBUGTYPE)
       #   HandleLLVMOptions: Release /Zi + /DEBUG
       - name: Patch DXC CMake (opt flags, strip CF/CET/debug)
@@ -202,88 +202,135 @@ jobs:
           $dstFlags = Join-Path $env:GITHUB_WORKSPACE "${{ env.DXC_PATH }}\cmake\DxcMsvcOptFlags.cmake"
           Copy-Item -Force $flagsFile $dstFlags
 
-          # --- strip /guard:cf, /CETCOMPAT, /INCREMENTAL:NO from root CMakeLists ---
-          $text = (Get-Content -Raw -Path $cmakeLists)
-          $patterns = @(
-            '(?ms)^# adjust link option to enable debugging from kernel mode; not compatible with incremental linking\r?\n' +
-              'if\(NOT CMAKE_VERSION VERSION_LESS "3\.13" AND MSVC AND NOT CMAKE_C_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64EC"\)\r?\n' +
-              '\s*add_link_options\(/DEBUGTYPE:CV,FIXUP,PDATA /INCREMENTAL:NO\)\r?\n' +
-              'endif\(\)\r?\n?',
-            '(?ms)^# enable control flow guard\r?\n' +
-              'if\(WIN32\)\r?\n' +
-              '\s*if\(MSVC\)\r?\n' +
-              '\s*add_compile_options\(/guard:cf\)\r?\n' +
-              '\s*add_link_options\(/guard:cf\)\r?\n' +
-              '\s*else\(\)\r?\n' +
-              '\s*add_compile_options\(-fcf-protection\)\r?\n' +
-              '\s*endif\(\)\r?\n' +
-              'endif\(WIN32\)\r?\n?',
-            '(?ms)^# Enable CET Shadow Stack\r?\n' +
-              'if\(MSVC AND NOT \(CMAKE_C_COMPILER_ARCHITECTURE_ID MATCHES "ARM\.\*"\)\)\r?\n' +
-              '\s*add_link_options\(/CETCOMPAT\)\r?\n' +
-              'endif\(\)\r?\n?'
-          )
-          foreach ($p in $patterns) {
-            $before = $text.Length
-            $text = [regex]::Replace($text, $p, "")
-            if ($text.Length -lt $before) { Write-Host "Stripped CMakeLists security/debug block" }
-            else { Write-Host "WARNING: CMakeLists pattern not found" }
+          # Normalize to LF line list (drop CR) for reliable matching.
+          $raw = [System.IO.File]::ReadAllText($cmakeLists) -replace "`r", ""
+          $srcLines = [System.Collections.Generic.List[string]]::new()
+          foreach ($l in ($raw -split "`n", [System.StringSplitOptions]::None)) {
+            $srcLines.Add([string]$l)
           }
-          $text = [regex]::Replace($text, '(?m)^\s*add_compile_options\(/guard:cf\)\s*\r?\n', '')
-          $text = [regex]::Replace($text, '(?m)^\s*add_link_options\(/guard:cf\)\s*\r?\n', '')
-          $text = [regex]::Replace($text, '(?m)^\s*add_link_options\(/CETCOMPAT\)\s*\r?\n', '')
-          $text = [regex]::Replace($text, '(?m)^\s*add_link_options\(/DEBUGTYPE:CV,FIXUP,PDATA /INCREMENTAL:NO\)\s*\r?\n', '')
 
-          $lines = [System.Collections.Generic.List[string]]($text -split "\n", [System.StringSplitOptions]::None)
+          function Test-DropLine([string]$line) {
+            $t = $line.Trim()
+            if ($t -match 'add_compile_options\s*\(\s*/guard:cf\s*\)') { return $true }
+            if ($t -match 'add_link_options\s*\(\s*/guard:cf\s*\)') { return $true }
+            if ($t -match 'add_link_options\s*\(\s*/CETCOMPAT\s*\)') { return $true }
+            if ($t -match 'add_link_options\s*\(.*/INCREMENTAL:NO') { return $true }
+            if ($t -match 'add_link_options\s*\(.*/DEBUGTYPE:') { return $true }
+            if ($t -eq 'add_compile_options(-fcf-protection)') { return $true }
+            if ($t -eq '# enable control flow guard') { return $true }
+            if ($t -eq '# Enable CET Shadow Stack') { return $true }
+            if ($t -like '# adjust link option to enable debugging from kernel mode*') { return $true }
+            return $false
+          }
 
-          if (-not ($lines -match 'DxcMsvcOptFlags\.cmake')) {
+          # Drop flag lines and collapse empty if/else shells that only held them.
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $dropped = 0
+          for ($i = 0; $i -lt $srcLines.Count; $i++) {
+            $line = $srcLines[$i]
+            if (Test-DropLine $line) {
+              $dropped++
+              Write-Host ("drop L{0}: {1}" -f ($i + 1), $line.Trim())
+              continue
+            }
+            $lines.Add([string]$line)
+          }
+          Write-Host "Dropped $dropped flag/comment lines from CMakeLists.txt"
+
+          # Remove empty leftover branches like:
+          #   if(MSVC)
+          #   else()
+          #   endif()
+          #   if(WIN32) ... endif(WIN32) with no body
+          $compact = [System.Collections.Generic.List[string]]::new()
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            $t = $lines[$i].Trim()
+            # skip empty if(MSVC)/else/endif triads with only blank lines inside
+            if ($t -eq 'if(MSVC)' -or $t -eq 'if(WIN32)' -or $t -like 'if(MSVC AND NOT*') {
+              # look ahead for empty body ending at matching endif
+              $j = $i + 1
+              $onlyBlankOrElse = $true
+              $sawEnd = $false
+              while ($j -lt $lines.Count) {
+                $tj = $lines[$j].Trim()
+                if ($tj -eq '' -or $tj -eq 'else()') { $j++; continue }
+                if ($tj -eq 'endif()' -or $tj -eq 'endif(WIN32)') { $sawEnd = $true; break }
+                $onlyBlankOrElse = $false
+                break
+              }
+              if ($onlyBlankOrElse -and $sawEnd) {
+                Write-Host ("drop empty branch L{0}-L{1}: {2}" -f ($i + 1), ($j + 1), $t)
+                $i = $j
+                continue
+              }
+            }
+            $compact.Add([string]$lines[$i])
+          }
+          $lines = $compact
+
+          # Inject opt flags after project(LLVM)
+          $already = $false
+          foreach ($l in $lines) {
+            if ($l -match 'DxcMsvcOptFlags\.cmake') { $already = $true; break }
+          }
+          if (-not $already) {
             $markerIdx = -1
             for ($i = 0; $i -lt $lines.Count; $i++) {
               if ($lines[$i].Trim() -eq 'project(LLVM)') { $markerIdx = $i; break }
             }
             if ($markerIdx -lt 0) { throw "Could not find project(LLVM) in CMakeLists.txt" }
-            $insert = @(
-              ''
-              '# --- begin dxc_windows_build MSVC opt flags (injected by CI) ---'
-              'include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/DxcMsvcOptFlags.cmake)'
-              '# --- end dxc_windows_build MSVC opt flags ---'
+
+            # List[string].InsertRange requires IEnumerable[string], not Object[].
+            [string[]]$insert = @(
+              '',
+              '# --- begin dxc_windows_build MSVC opt flags (injected by CI) ---',
+              'include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/DxcMsvcOptFlags.cmake)',
+              '# --- end dxc_windows_build MSVC opt flags ---',
               ''
             )
             $lines.InsertRange($markerIdx + 1, $insert)
             Write-Host "Injected DxcMsvcOptFlags.cmake after project(LLVM)"
-          }
-
-          Set-Content -Path $cmakeLists -Value $lines -Encoding utf8NoBOM
-
-          # --- strip Release /Zi + /DEBUG from HandleLLVMOptions.cmake ---
-          $ho = Get-Content -Raw -Path $handleOpts
-          $hoPattern = '(?ms)^\s*# Change release to always build debug information out-of-line, but\r?\n' +
-            '\s*# also enable Reference optimization, ie dead function elimination\.\r?\n' +
-            '\s*if \(NOT CMAKE_MSVC_DEBUG_INFORMATION_FORMAT\)\r?\n' +
-            '\s*append\("/Zi" CMAKE_CXX_FLAGS_RELEASE\)\r?\n' +
-            '\s*append\("/DEBUG /OPT:REF" CMAKE_SHARED_LINKER_FLAGS_RELEASE\)\r?\n' +
-            '\s*append\("/DEBUG /OPT:REF" CMAKE_EXE_LINKER_FLAGS_RELEASE\)\r?\n' +
-            '\s*endif\(\)\r?\n?'
-          # Avoid PowerShell here-strings in YAML run blocks: terminator must be
-          # column-0 which breaks YAML indentation of `run: |`.
-          $hoReplacement = (
-            '  # dxc_windows_build: PDB stripped for size. Keep /OPT:REF only.',
-            '  append("/OPT:REF" CMAKE_SHARED_LINKER_FLAGS_RELEASE)',
-            '  append("/OPT:REF" CMAKE_EXE_LINKER_FLAGS_RELEASE)',
-            ''
-          ) -join "`n"
-          $hoNew = [regex]::Replace($ho, $hoPattern, $hoReplacement)
-          if ($hoNew -eq $ho) {
-            Write-Host "WARNING: HandleLLVMOptions /Zi block pattern not found; applying line fallbacks"
-            $hoNew = [regex]::Replace($ho, '(?m)^\s*append\("/Zi" CMAKE_CXX_FLAGS_RELEASE\)\s*\r?\n', '')
-            $hoNew = [regex]::Replace($hoNew, '(?m)^\s*append\("/DEBUG /OPT:REF" CMAKE_SHARED_LINKER_FLAGS_RELEASE\)\s*\r?\n',
-              "  append(`"/OPT:REF`" CMAKE_SHARED_LINKER_FLAGS_RELEASE)`n")
-            $hoNew = [regex]::Replace($hoNew, '(?m)^\s*append\("/DEBUG /OPT:REF" CMAKE_EXE_LINKER_FLAGS_RELEASE\)\s*\r?\n',
-              "  append(`"/OPT:REF`" CMAKE_EXE_LINKER_FLAGS_RELEASE)`n")
           } else {
-            Write-Host "Patched HandleLLVMOptions Release PDB block"
+            Write-Host "MSVC opt flags already present"
           }
-          Set-Content -Path $handleOpts -Value $hoNew -Encoding utf8NoBOM
+
+          [System.IO.File]::WriteAllLines($cmakeLists, $lines.ToArray())
+
+          # --- strip Release /Zi + /DEBUG from HandleLLVMOptions.cmake (line-based) ---
+          $hoRaw = [System.IO.File]::ReadAllText($handleOpts) -replace "`r", ""
+          $hoLines = [System.Collections.Generic.List[string]]::new()
+          foreach ($l in ($hoRaw -split "`n", [System.StringSplitOptions]::None)) {
+            $hoLines.Add([string]$l)
+          }
+          $hoOut = [System.Collections.Generic.List[string]]::new()
+          $hoDropped = 0
+          $optRefSharedDone = $false
+          $optRefExeDone = $false
+          foreach ($line in $hoLines) {
+            $t = $line.Trim()
+            if ($t -match '^append\("/Zi"\s+CMAKE_CXX_FLAGS_RELEASE\)') {
+              $hoDropped++; Write-Host "drop HandleLLVM: $t"; continue
+            }
+            if ($t -match '^append\("/DEBUG /OPT:REF"\s+CMAKE_SHARED_LINKER_FLAGS_RELEASE\)') {
+              $hoDropped++
+              if (-not $optRefSharedDone) {
+                $hoOut.Add('  append("/OPT:REF" CMAKE_SHARED_LINKER_FLAGS_RELEASE)')
+                $optRefSharedDone = $true
+              }
+              continue
+            }
+            if ($t -match '^append\("/DEBUG /OPT:REF"\s+CMAKE_EXE_LINKER_FLAGS_RELEASE\)') {
+              $hoDropped++
+              if (-not $optRefExeDone) {
+                $hoOut.Add('  append("/OPT:REF" CMAKE_EXE_LINKER_FLAGS_RELEASE)')
+                $optRefExeDone = $true
+              }
+              continue
+            }
+            $hoOut.Add([string]$line)
+          }
+          Write-Host "HandleLLVMOptions dropped/replaced $hoDropped debug lines"
+          [System.IO.File]::WriteAllLines($handleOpts, $hoOut.ToArray())
 
           # late scrub via ENDS_INCLUDE after all flags settled (no here-string)
           $scrub = (
@@ -311,17 +358,21 @@ jobs:
             'endif()'
           ) -join "`n"
           $scrubPath = Join-Path $env:GITHUB_WORKSPACE "${{ env.DXC_PATH }}\cmake\DxcMsvcEndsScrub.cmake"
-          Set-Content -Path $scrubPath -Value $scrub -Encoding utf8NoBOM
+          [System.IO.File]::WriteAllText($scrubPath, $scrub + "`n")
 
           Write-Host "--- verify root CMakeLists ---"
-          Select-String -Path $cmakeLists -Pattern 'DxcMsvcOptFlags|guard:cf|CETCOMPAT|INCREMENTAL:NO|DEBUGTYPE' |
-            ForEach-Object { Write-Host ("{0}: {1}" -f $_.LineNumber, $_.Line.Trim()) }
-          if (Select-String -Path $cmakeLists -Pattern 'add_(compile|link)_options\(/(guard:cf|CETCOMPAT)|INCREMENTAL:NO') {
-            throw "Still found stripped flags in CMakeLists.txt"
-          }
+          $verify = [System.IO.File]::ReadAllText($cmakeLists)
+          if ($verify -notmatch 'DxcMsvcOptFlags\.cmake') { throw "opt flags include missing after patch" }
+          if ($verify -match 'add_(compile|link)_options\s*\(\s*/guard:cf') { throw "guard:cf still present" }
+          if ($verify -match 'add_link_options\s*\(\s*/CETCOMPAT') { throw "CETCOMPAT still present" }
+          if ($verify -match 'INCREMENTAL:NO') { throw "INCREMENTAL:NO still present" }
+          Write-Host "CMakeLists patch OK"
+
           Write-Host "--- verify HandleLLVMOptions ---"
-          Select-String -Path $handleOpts -Pattern '"/Zi"|"/DEBUG' |
-            ForEach-Object { Write-Host ("{0}: {1}" -f $_.LineNumber, $_.Line.Trim()) }
+          $hov = [System.IO.File]::ReadAllText($handleOpts)
+          if ($hov -match 'append\("/Zi"\s+CMAKE_CXX_FLAGS_RELEASE\)') { throw "/Zi Release still present in HandleLLVMOptions" }
+          if ($hov -match 'append\("/DEBUG /OPT:REF"') { throw "/DEBUG /OPT:REF still present in HandleLLVMOptions" }
+          Write-Host "HandleLLVMOptions patch OK"
 
       # PredefinedParams.cmake forces HLSL_INCLUDE_TESTS/SPIRV_BUILD_TESTS ON via
       # CACHE. Command-line -D is applied before -C and is not overwritten without

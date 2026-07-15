@@ -128,6 +128,14 @@ jobs:
           where python
           python --version
 
+      # PredefinedParams.cmake forces HLSL_INCLUDE_TESTS/SPIRV_BUILD_TESTS ON via
+      # CACHE. Command-line -D is applied before -C and is not overwritten without
+      # FORCE, so overrides must be present (order relative to -C is fine for -D).
+      #
+      # DXC Windows test CMake hard-depends check-* targets on ExecHLSLTests /
+      # dxc_batch / ClangHLSLTests. Those targets are only created when
+      # HLSL_INCLUDE_TESTS=ON. Turning only HLSL tests OFF while leaving
+      # LLVM/CLANG tests ON leaves dangling DEPENDS and breaks generate.
       - name: Configure (CMake + VS2022 + toolset)
         working-directory: ${{ env.DXC_PATH }}
         run: |
@@ -135,12 +143,14 @@ jobs:
             -G "Visual Studio 17 2022" ^
             -A x64 ^
             -T ${{ steps.opts.outputs.toolset }} ^
-            -C cmake\caches\PredefinedParams.cmake ^
-            -DCMAKE_SYSTEM_VERSION=10.0.26100.0 ^
-            -DENABLE_SPIRV_CODEGEN=${{ steps.opts.outputs.spirv }} ^
-            -DSPIRV_BUILD_TESTS=OFF ^
+            -DLLVM_INCLUDE_TESTS=OFF ^
+            -DCLANG_INCLUDE_TESTS=OFF ^
             -DHLSL_INCLUDE_TESTS=OFF ^
-            -DLLVM_ENABLE_ASSERTIONS=ON
+            -DSPIRV_BUILD_TESTS=OFF ^
+            -DENABLE_SPIRV_CODEGEN=${{ steps.opts.outputs.spirv }} ^
+            -DLLVM_ENABLE_ASSERTIONS=ON ^
+            -DCMAKE_SYSTEM_VERSION=10.0.26100.0 ^
+            -C cmake\caches\PredefinedParams.cmake
 
       - name: Build
         run: |

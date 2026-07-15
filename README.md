@@ -51,11 +51,13 @@ cmake -S . -B build ^
   -G "Visual Studio 17 2022" ^
   -A x64 ^
   -T v142 ^
-  -C cmake\caches\PredefinedParams.cmake ^
-  -DCMAKE_SYSTEM_VERSION=10.0.26100.0 ^
-  -DENABLE_SPIRV_CODEGEN=ON ^
+  -DLLVM_INCLUDE_TESTS=OFF ^
+  -DCLANG_INCLUDE_TESTS=OFF ^
+  -DHLSL_INCLUDE_TESTS=OFF ^
   -DSPIRV_BUILD_TESTS=OFF ^
-  -DHLSL_INCLUDE_TESTS=OFF
+  -DENABLE_SPIRV_CODEGEN=ON ^
+  -DCMAKE_SYSTEM_VERSION=10.0.26100.0 ^
+  -C cmake\caches\PredefinedParams.cmake
 
 cmake --build build --config Release --parallel --target dxc dxcompiler dxv dxildll
 ```

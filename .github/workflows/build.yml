@@ -1,0 +1,50 @@
+name: Build rufus
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    env:
+      PROJECT_REPOSITORY: pbatard/rufus
+      PROJECT_VERSION: v3.22
+      PROJECT_PATH: rufus
+      PROJECT_BIN: rufus
+    strategy:
+      matrix:
+        os: [windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout ${{ env.PROJECT_PATH }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.PROJECT_REPOSITORY }}
+          ref: refs/tags/${{ env.PROJECT_VERSION }}
+          path: ${{ env.PROJECT_PATH }}
+
+      - name: Setup msbuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Build
+        working-directory: ${{ env.PROJECT_PATH }}
+        run: |
+          msbuild rufus.sln `
+          /p:PlatformToolset=v142 `
+          /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+          /p:Platform=x64 `
+          /p:Configuration=Release `
+          /p:WholeProgramOptimization=true `
+          /p:Optimization=MinSpace `
+          /p:FunctionLevelLinking=true
+
+      - name: Archive
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.PROJECT_BIN }}_${{ runner.os }}
+          path: |
+            ${{ env.PROJECT_PATH }}/x64/Release/*.dll
+
+            ${{ env.PROJECT_PATH }}/x64/Release/${{ env.PROJECT_BIN }}.exe

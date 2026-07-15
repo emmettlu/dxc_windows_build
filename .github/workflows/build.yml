@@ -1,50 +1,234 @@
-name: Build rufus
+name: Build
 
 on:
   push:
   workflow_dispatch:
+    inputs:
+      dxc_ref:
+        description: "DirectXShaderCompiler git ref (branch/tag/SHA)"
+        required: false
+        default: "main"
+      toolset:
+        description: "MSVC platform toolset (v142 / v143)"
+        required: false
+        default: "v142"
+      configuration:
+        description: "Build configuration"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+          - Debug
+      build_spirv:
+        description: "Enable SPIR-V codegen"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  DXC_REPOSITORY: microsoft/DirectXShaderCompiler
+  DXC_PATH: DirectXShaderCompiler
+  BUILD_PATH: build
 
 jobs:
   build:
-    env:
-      PROJECT_REPOSITORY: pbatard/rufus
-      PROJECT_VERSION: v3.22
-      PROJECT_PATH: rufus
-      PROJECT_BIN: rufus
-    strategy:
-      matrix:
-        os: [windows-2022]
-    runs-on: ${{ matrix.os }}
+    name: Windows x64 ${{ github.event.inputs.toolset || 'v142' }} ${{ github.event.inputs.configuration || 'Release' }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: cmd
+
     steps:
-      - name: Checkout ${{ env.PROJECT_PATH }}
+      - name: Resolve build options
+        id: opts
+        shell: pwsh
+        run: |
+          $ref = if ("${{ github.event.inputs.dxc_ref }}") { "${{ github.event.inputs.dxc_ref }}" } else { "main" }
+          $toolset = if ("${{ github.event.inputs.toolset }}") { "${{ github.event.inputs.toolset }}" } else { "v142" }
+          $config = if ("${{ github.event.inputs.configuration }}") { "${{ github.event.inputs.configuration }}" } else { "Release" }
+          $spirvInput = "${{ github.event.inputs.build_spirv }}"
+          $spirv = if ($spirvInput -eq "" -or $spirvInput -eq "true") { "ON" } else { "OFF" }
+
+          if ($toolset -notin @("v142", "v143")) {
+            throw "Unsupported toolset: $toolset (expected v142 or v143)"
+          }
+
+          "dxc_ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "toolset=$toolset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "configuration=$config" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "spirv=$spirv" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "artifact_name=dxc-windows-x64-$toolset-$config" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Write-Host "DXC ref:        $ref"
+          Write-Host "Toolset:       $toolset"
+          Write-Host "Configuration: $config"
+          Write-Host "SPIR-V:        $spirv"
+
+      - name: Checkout DXC
         uses: actions/checkout@v6
         with:
-          repository: ${{ env.PROJECT_REPOSITORY }}
-          ref: refs/tags/${{ env.PROJECT_VERSION }}
-          path: ${{ env.PROJECT_PATH }}
+          repository: ${{ env.DXC_REPOSITORY }}
+          ref: ${{ steps.opts.outputs.dxc_ref }}
+          path: ${{ env.DXC_PATH }}
+          submodules: recursive
 
-      - name: Setup msbuild
+      - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
 
-      - name: Build
-        working-directory: ${{ env.PROJECT_PATH }}
+      - name: Ensure MSVC toolset is installed
+        shell: pwsh
         run: |
-          msbuild rufus.sln `
-          /p:PlatformToolset=v142 `
-          /p:WindowsTargetPlatformVersion=10.0.19041.0 `
-          /p:Platform=x64 `
-          /p:Configuration=Release `
-          /p:WholeProgramOptimization=true `
-          /p:Optimization=MinSpace `
-          /p:FunctionLevelLinking=true
+          $toolset = "${{ steps.opts.outputs.toolset }}"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
 
-      - name: Archive
-        uses: actions/upload-artifact@v5
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio with C++ tools not found" }
+          Write-Host "VS path: $vsPath"
+
+          $needInstall = $false
+          if ($toolset -eq "v142") {
+            $comp = "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64"
+            # Common install roots for MSVC 14.29 (VS2019 toolset) under VS2022
+            $roots = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like "14.29*" }
+            if (-not $roots) {
+              Write-Host "v142 (14.29.x) not found, will install component: $comp"
+              $needInstall = $true
+            } else {
+              Write-Host "Found v142 MSVC: $($roots.Name -join ', ')"
+            }
+
+            if ($needInstall) {
+              $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+              if (-not (Test-Path $installer)) { throw "VS installer setup.exe not found" }
+              & $installer modify `
+                --installPath $vsPath `
+                --add $comp `
+                --quiet --norestart --force `
+                --wait
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to install $comp (exit $LASTEXITCODE)"
+              }
+            }
+          } else {
+            Write-Host "Using default toolset path for $toolset"
+          }
+
+      - name: Show toolchain
+        run: |
+          where cmake
+          cmake --version
+          where python
+          python --version
+
+      - name: Configure (CMake + VS2022 + toolset)
+        working-directory: ${{ env.DXC_PATH }}
+        run: |
+          cmake -S . -B ..\${{ env.BUILD_PATH }} ^
+            -G "Visual Studio 17 2022" ^
+            -A x64 ^
+            -T ${{ steps.opts.outputs.toolset }} ^
+            -C cmake\caches\PredefinedParams.cmake ^
+            -DCMAKE_SYSTEM_VERSION=10.0.26100.0 ^
+            -DENABLE_SPIRV_CODEGEN=${{ steps.opts.outputs.spirv }} ^
+            -DSPIRV_BUILD_TESTS=OFF ^
+            -DHLSL_INCLUDE_TESTS=OFF ^
+            -DLLVM_ENABLE_ASSERTIONS=ON
+
+      - name: Build
+        run: |
+          cmake --build ${{ env.BUILD_PATH }} --config ${{ steps.opts.outputs.configuration }} --parallel --target dxc dxcompiler dxv dxildll
+
+      - name: Stage binaries
+        id: stage
+        shell: pwsh
+        run: |
+          $config = "${{ steps.opts.outputs.configuration }}"
+          $candidates = @(
+            "${{ env.BUILD_PATH }}\$config\bin",
+            "${{ env.BUILD_PATH }}\bin\$config",
+            "${{ env.BUILD_PATH }}\$config",
+            "${{ env.BUILD_PATH }}\bin"
+          )
+
+          $binDir = $null
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "dxc.exe")) {
+              $binDir = (Resolve-Path $c).Path
+              break
+            }
+          }
+          if (-not $binDir) {
+            Write-Host "Search results:"
+            Get-ChildItem -Path "${{ env.BUILD_PATH }}" -Recurse -Filter "dxc.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host $_.FullName }
+            throw "dxc.exe not found under ${{ env.BUILD_PATH }}"
+          }
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE "artifact\dxc"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $required = @("dxc.exe", "dxcompiler.dll")
+          $optional = @("dxv.exe", "dxil.dll", "dxcompiler.lib", "dxcompiler.pdb", "dxc.pdb")
+
+          foreach ($f in $required) {
+            $src = Join-Path $binDir $f
+            if (-not (Test-Path $src)) { throw "Required file missing: $src" }
+            Copy-Item $src $stage
+          }
+          foreach ($f in $optional) {
+            $src = Join-Path $binDir $f
+            if (Test-Path $src) { Copy-Item $src $stage }
+          }
+
+          # Record source info for consumers
+          $info = @(
+            "repository=${{ env.DXC_REPOSITORY }}",
+            "ref=${{ steps.opts.outputs.dxc_ref }}",
+            "toolset=${{ steps.opts.outputs.toolset }}",
+            "configuration=$config",
+            "spirv=${{ steps.opts.outputs.spirv }}",
+            "runner=$env:ImageOS $env:ImageVersion"
+          )
+          $info | Set-Content -Path (Join-Path $stage "build-info.txt") -Encoding utf8
+
+          Write-Host "Staged from: $binDir"
+          Get-ChildItem $stage | Format-Table Name, Length
+
+          "bin_dir=$binDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "stage_dir=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $dxc = Join-Path "${{ steps.stage.outputs.stage_dir }}" "dxc.exe"
+          & $dxc -help
+          if ($LASTEXITCODE -ne 0) { throw "dxc -help failed" }
+
+          $hlsl = @"
+          float4 main() : SV_Target {
+            return float4(1, 0, 0, 1);
+          }
+          "@
+          $src = Join-Path $env:RUNNER_TEMP "smoke.hlsl"
+          $out = Join-Path $env:RUNNER_TEMP "smoke.dxil"
+          Set-Content -Path $src -Value $hlsl -Encoding ascii
+          & $dxc -T ps_6_0 -E main $src -Fo $out
+          if ($LASTEXITCODE -ne 0) { throw "dxc smoke compile failed" }
+          if (-not (Test-Path $out)) { throw "smoke output missing" }
+          Write-Host "Smoke compile OK: $out"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.PROJECT_BIN }}_${{ runner.os }}
-          path: |
-            ${{ env.PROJECT_PATH }}/x64/Release/*.dll
-
-            ${{ env.PROJECT_PATH }}/x64/Release/${{ env.PROJECT_BIN }}.exe
+          name: ${{ steps.opts.outputs.artifact_name }}
+          path: artifact/dxc/**
+          if-no-files-found: error
+          retention-days: 30

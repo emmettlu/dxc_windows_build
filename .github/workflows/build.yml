@@ -31,6 +31,8 @@ env:
   DXC_REPOSITORY: microsoft/DirectXShaderCompiler
   DXC_PATH: DirectXShaderCompiler
   BUILD_PATH: build
+  ATLMFC_ARCHIVE: atlmfc.7z
+  ATLMFC_EXTRACT_DIR: atlmfc-extract
 
 jobs:
   build:
@@ -68,8 +70,12 @@ jobs:
           Write-Host "Configuration: $config"
           Write-Host "SPIR-V:        $spirv"
 
+      # This repo holds the workflow + atlmfc.7z; DXC source is checked out separately.
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
       - name: Checkout DXC
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.DXC_REPOSITORY }}
           ref: ${{ steps.opts.outputs.dxc_ref }}
@@ -81,45 +87,92 @@ jobs:
         with:
           msbuild-architecture: x64
 
-      - name: Ensure MSVC toolset is installed
+      # Prefer vendored atlmfc.7z over VS Installer components.
+      # MSVC looks for ATL at: $(VCToolsInstallDir)atlmfc\{include,lib}
+      # INCLUDE/LIB alone is insufficient for the VS generator.
+      - name: Extract and install atlmfc for selected toolset
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $toolset = "${{ steps.opts.outputs.toolset }}"
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $archive = Join-Path $env:GITHUB_WORKSPACE "${{ env.ATLMFC_ARCHIVE }}"
+          if (-not (Test-Path $archive)) {
+            throw "Missing ${{ env.ATLMFC_ARCHIVE }} in workflow repo root"
+          }
 
+          $extractRoot = Join-Path $env:GITHUB_WORKSPACE "${{ env.ATLMFC_EXTRACT_DIR }}"
+          if (Test-Path $extractRoot) { Remove-Item -Recurse -Force $extractRoot }
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+
+          Write-Host "Extracting $archive -> $extractRoot"
+          & 7z x -y "-o$extractRoot" $archive | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "7z extract failed: $LASTEXITCODE" }
+
+          $srcAtlmfc = Join-Path $extractRoot "atlmfc"
+          if (-not (Test-Path (Join-Path $srcAtlmfc "include\atlbase.h"))) {
+            # tolerate archive root without nested atlmfc/
+            if (Test-Path (Join-Path $extractRoot "include\atlbase.h")) {
+              $srcAtlmfc = $extractRoot
+            } else {
+              throw "atlbase.h not found after extract under $extractRoot"
+            }
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw "Visual Studio with C++ tools not found" }
           Write-Host "VS path: $vsPath"
 
-          $needInstall = $false
-          if ($toolset -eq "v142") {
-            $comp = "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64"
-            # Common install roots for MSVC 14.29 (VS2019 toolset) under VS2022
-            $roots = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -like "14.29*" }
-            if (-not $roots) {
-              Write-Host "v142 (14.29.x) not found, will install component: $comp"
-              $needInstall = $true
-            } else {
-              Write-Host "Found v142 MSVC: $($roots.Name -join ', ')"
-            }
+          $msvcGlob = if ($toolset -eq "v142") { "14.29*" } else { "14.3*" }
+          $msvcRoots = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like $msvcGlob } |
+            Sort-Object Name -Descending
 
-            if ($needInstall) {
+          if (-not $msvcRoots) {
+            if ($toolset -eq "v142") {
+              Write-Host "v142 compiler missing; installing MSVC 14.29 x64/x86 tools"
               $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-              if (-not (Test-Path $installer)) { throw "VS installer setup.exe not found" }
               & $installer modify `
                 --installPath $vsPath `
-                --add $comp `
-                --quiet --norestart --force `
-                --wait
+                --add Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64 `
+                --quiet --norestart --force --wait
               if ($LASTEXITCODE -ne 0) {
-                throw "Failed to install $comp (exit $LASTEXITCODE)"
+                throw "Failed to install v142 compiler tools (exit $LASTEXITCODE)"
               }
+              $msvcRoots = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like $msvcGlob } |
+                Sort-Object Name -Descending
             }
-          } else {
-            Write-Host "Using default toolset path for $toolset"
           }
+
+          if (-not $msvcRoots) {
+            throw "No MSVC directory matching $msvcGlob under $vsPath\VC\Tools\MSVC"
+          }
+
+          foreach ($root in $msvcRoots) {
+            $dst = Join-Path $root.FullName "atlmfc"
+            Write-Host "Installing ATL into: $dst"
+            if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+            Copy-Item -Recurse -Force $srcAtlmfc $dst
+            if (-not (Test-Path (Join-Path $dst "include\atlbase.h"))) {
+              throw "atlbase.h missing after install into $dst"
+            }
+          }
+
+          # Env fallback for tools that honor INCLUDE/LIB (not enough alone for VS gen)
+          $includeDir = (Resolve-Path (Join-Path $msvcRoots[0].FullName "atlmfc\include")).Path
+          $libDir = Join-Path $msvcRoots[0].FullName "atlmfc\lib\x64"
+          if (-not (Test-Path $libDir)) { $libDir = Join-Path $msvcRoots[0].FullName "atlmfc\lib" }
+          $libDir = (Resolve-Path $libDir).Path
+
+          "INCLUDE=$includeDir;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIB=$libDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LIBPATH=$libDir;$env:LIBPATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # PATH is optional for atl headers/libs; keep for any runtime helpers next to libs
+          "PATH=$libDir;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "ATL include: $includeDir"
+          Write-Host "ATL lib:     $libDir"
 
       - name: Show toolchain
         run: |
@@ -127,10 +180,13 @@ jobs:
           cmake --version
           where python
           python --version
+          where 7z
+          echo INCLUDE=%INCLUDE%
+          echo LIB=%LIB%
 
       # PredefinedParams.cmake forces HLSL_INCLUDE_TESTS/SPIRV_BUILD_TESTS ON via
       # CACHE. Command-line -D is applied before -C and is not overwritten without
-      # FORCE, so overrides must be present (order relative to -C is fine for -D).
+      # FORCE, so overrides must be present.
       #
       # DXC Windows test CMake hard-depends check-* targets on ExecHLSLTests /
       # dxc_batch / ClangHLSLTests. Those targets are only created when
@@ -198,7 +254,6 @@ jobs:
             if (Test-Path $src) { Copy-Item $src $stage }
           }
 
-          # Record source info for consumers
           $info = @(
             "repository=${{ env.DXC_REPOSITORY }}",
             "ref=${{ steps.opts.outputs.dxc_ref }}",
@@ -236,7 +291,7 @@ jobs:
           Write-Host "Smoke compile OK: $out"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.opts.outputs.artifact_name }}
           path: artifact/dxc/**

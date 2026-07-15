@@ -66,4 +66,8 @@ cmake --build build --config Release --parallel --target dxc dxcompiler dxv dxil
 
 - 本仓库本身不包含 DXC 源码，CI 每次从上游拉取。
 - 构建较久（常 1h+），workflow `timeout-minutes: 180`。
-- 若 image 上缺少 v142，在 VS Installer 勾选 **MSVC v142 - VS 2019 C++ x64/x86 build tools**，或把 `toolset` 改成 `v143`。
+- ATL 来自本仓库 `atlmfc.7z`：CI 解压后拷贝到选中 MSVC 工具集目录
+  `VC\Tools\MSVC\<ver>\atlmfc\{include,lib}`（VS generator 认这个路径）。
+- 若 image 上缺少 v142 编译器本身，会装
+  `Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64`。
+- 也可把 `toolset` 改成 `v143`。

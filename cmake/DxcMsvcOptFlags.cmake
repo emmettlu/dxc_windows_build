@@ -1,28 +1,3 @@
-# MSVC flags injected by dxc_windows_build CI.
-# Applied after project(LLVM) so compiler ID is known, and before add_subdirectory
-# targets are created (add_compile_options only affects later targets).
-#
-# Conflict notes (checked against DirectXShaderCompiler CMake):
-# - /GR-   HARD CONFLICT: PredefinedParams sets LLVM_ENABLE_RTTI=ON and
-#          LLVM_ENABLE_EH=ON; targets compile with RTTI + /EHsc. Global /GR-
-#          causes D9025 and breaks dynamic_cast / COM / exception paths.
-# - /MD /MDd  REDUNDANT: ChooseMSVCCRT / CMake defaults already set CRT.
-# - /Zi + /DEBUG on Release: DXC HandleLLVMOptions forces them; CI patches that
-#          block out, and this file scrubs leftovers + /DEBUG:NONE.
-# - /GL + /LTCG  OVERLAP: LLVM_ENABLE_LTO path also adds these; safe to
-#          enable here for size-focused Release without flipping that option.
-# - /OPT:REF /OPT:ICF kept for size (no /DEBUG).
-# - /guard:cf + /CETCOMPAT + /INCREMENTAL:NO stripped from root CMakeLists by CI.
-# - /GS-   INTENTIONAL override of buffer security checks for size.
-# - /Os vs /O2  CMake default Release is /O2; /Os may warn D9025 and win by order.
-# - /arch:AVX2  no CMake conflict; binary requires AVX2 hosts.
-# - /fp:fast    no CMake conflict; may change host FP semantics inside DXC.
-# - /MANIFEST:NO enabled for smaller images.
-
-if(NOT MSVC)
-  return()
-endif()
-
 message(STATUS "dxc_windows_build: applying optimized MSVC compile/link flags (no PDB)")
 
 # Scrub PDB/debug flags if already present (HandleLLVMOptions may run later;
@@ -51,7 +26,6 @@ add_compile_options(
   $<$<CONFIG:Debug>:/MP>
 
   $<$<CONFIG:Release>:/arch:AVX2>
-  $<$<CONFIG:Release>:/fp:fast>
   $<$<CONFIG:Release>:/Gy>
   $<$<CONFIG:Release>:/GL>
   $<$<CONFIG:Release>:/Gw>
@@ -63,7 +37,6 @@ add_compile_options(
 
 add_compile_options(
   $<$<CONFIG:RelWithDebInfo>:/arch:AVX2>
-  $<$<CONFIG:RelWithDebInfo>:/fp:fast>
   $<$<CONFIG:RelWithDebInfo>:/Gy>
   $<$<CONFIG:RelWithDebInfo>:/Gw>
   $<$<CONFIG:RelWithDebInfo>:/MP>
